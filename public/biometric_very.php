@@ -5,13 +5,37 @@ require __DIR__ . '/../config/config.php';
 verify_csrf();
 
 /*
- * Voz: vector de 24 bandas de frecuencia (timbre).
- * VOICE_MAX_DISTANCE = diferencia promedio máxima en dB entre la voz
- * guardada y la nueva. Más bajo = más estricto. Calíbralo con pruebas
- * (la distancia real queda anotada en login_attempts.reason).
+ * VOZ
+ * Cada muestra = 25 valores: 12 MFCC (media) + 12 MFCC (variación) + tono.
+ * Al registrarse se graban 3 muestras: se guarda su promedio (25 valores)
+ * y una tolerancia propia del usuario (valor 26).
  */
-const VOICE_DIMS = 24;
-const VOICE_MAX_DISTANCE = 6.0;
+const VOICE_DIMS = 25;
+const VOICE_ENROLL_SAMPLES = 3;
+const VOICE_MIN_LIMIT = 1.5;          // límite mínimo de aceptación
+const VOICE_MAX_ABS = 5.0;            // límite máximo, aunque el registro haya sido flojo
+const VOICE_TOL_FACTOR = 1.6;         // margen sobre la variación propia del usuario
+const VOICE_MAX_ENROLL_SPREAD = 4.0;  // si las 3 grabaciones difieren más, se rechaza el registro
+
+function voice_distance(array $a, array $b): float
+{
+    $mean = 0.0;
+    $spread = 0.0;
+
+    for ($i = 0; $i < 12; $i++) {
+        $d = (float)$a[$i] - (float)$b[$i];
+        $mean += $d * $d;
+    }
+
+    for ($i = 12; $i < 24; $i++) {
+        $d = (float)$a[$i] - (float)$b[$i];
+        $spread += $d * $d;
+    }
+
+    $pitch = abs((float)$a[24] - (float)$b[24]); // semitonos
+
+    return sqrt($mean / 12) + 0.5 * sqrt($spread / 12) + 0.3 * $pitch;
+}
 
 
 /*
@@ -36,7 +60,7 @@ if (($_POST['setup'] ?? '') === '1') {
         $fail('Tu sesión expiró. Inicia sesión otra vez.', 401);
     }
 
-    $expected = $setupMethod === 'face' ? 128 : ($setupMethod === 'voice' ? VOICE_DIMS : 0);
+    $expected = $setupMethod === 'face' ? 128 : ($setupMethod === 'voice' ? VOICE_DIMS * VOICE_ENROLL_SAMPLES : 0);
     $values = json_decode((string)($_POST['template'] ?? ''), true);
 
     if ($expected === 0) {
@@ -57,11 +81,42 @@ if (($_POST['setup'] ?? '') === '1') {
         $clean[] = (float)$value;
     }
 
+    $toStore = $clean;
+
+    if ($setupMethod === 'voice') {
+
+        $samples = array_chunk($clean, VOICE_DIMS);
+        $count = count($samples);
+
+        $average = array_fill(0, VOICE_DIMS, 0.0);
+
+        foreach ($samples as $sample) {
+            foreach ($sample as $i => $value) {
+                $average[$i] += $value / $count;
+            }
+        }
+
+        $tolerance = 0.0;
+
+        for ($a = 0; $a < $count; $a++) {
+            for ($b = $a + 1; $b < $count; $b++) {
+                $tolerance = max($tolerance, voice_distance($samples[$a], $samples[$b]));
+            }
+        }
+
+        if ($tolerance > VOICE_MAX_ENROLL_SPREAD) {
+            $fail('Las 3 grabaciones fueron muy distintas entre sí. Repite la misma frase igual las 3 veces, en un lugar silencioso.');
+        }
+
+        $average[] = $tolerance;
+        $toStore = $average;
+    }
+
     $column = $setupMethod === 'face' ? 'face_template' : 'voice_template';
 
     $update = db()->prepare("UPDATE users SET {$column} = ? WHERE id = ?");
     $update->execute([
-        json_encode($clean, JSON_THROW_ON_ERROR),
+        json_encode($toStore, JSON_THROW_ON_ERROR),
         (int)$current['id']
     ]);
 
@@ -296,46 +351,29 @@ if (
             );
 
 
-        if (is_array($incoming) && (!is_array($stored) || count($stored) !== VOICE_DIMS)) {
-            if ((int)(current_user()['id'] ?? 0) === (int)$user['id']) {
-                $update = $pdo->prepare('UPDATE users SET voice_template = ? WHERE id = ?');
-                $update->execute([
-                    json_encode($incoming, JSON_THROW_ON_ERROR),
-                    (int)$user['id']
-                ]);
+        if (!is_array($stored) || count($stored) !== VOICE_DIMS + 1) {
 
+            $reason = 'Este usuario no tiene una voz registrada (o es de una versión anterior). Regístrala desde el panel.';
+
+        } elseif (is_array($incoming) && count($incoming) === VOICE_DIMS) {
+
+            $distance = voice_distance($incoming, $stored);
+            $tolerance = (float)$stored[VOICE_DIMS];
+
+            // Límite propio del usuario, acotado entre un mínimo y un máximo
+            $limit = min(
+                VOICE_MAX_ABS,
+                max(VOICE_MIN_LIMIT, $tolerance * VOICE_TOL_FACTOR)
+            );
+
+            $detail = 'distancia ' . round($distance, 2) . ', límite ' . round($limit, 2);
+
+            if ($distance < $limit) {
                 $success = true;
-                $reason = null;
+                $reason = 'Voz coincide (' . $detail . ')';
             } else {
-                $reason = 'Este usuario aún no tiene una voz registrada.';
+                $reason = 'Voz no coincide (' . $detail . ')';
             }
-        } elseif (
-            is_array($incoming) &&
-            is_array($stored) &&
-            count($incoming) === VOICE_DIMS &&
-            count($stored) === VOICE_DIMS
-        ) {
-
-            // Diferencia promedio (RMS) por banda, en dB
-            $sum = 0.0;
-
-            for ($i = 0; $i < VOICE_DIMS; $i++) {
-                $difference = (float)$incoming[$i] - (float)$stored[$i];
-                $sum += $difference * $difference;
-            }
-
-            $distance = sqrt($sum / VOICE_DIMS);
-
-            if ($distance < VOICE_MAX_DISTANCE) {
-                $success = true;
-                $reason = null;
-            } else {
-                $reason = 'Voz no coincide (distancia ' . round($distance, 2) . ')';
-            }
-
-        } elseif (is_array($stored) && count($stored) !== VOICE_DIMS) {
-
-            $reason = 'Tu voz se registró con una versión anterior. Regístrala de nuevo.';
 
         }
 

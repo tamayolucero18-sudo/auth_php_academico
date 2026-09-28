@@ -583,6 +583,233 @@ async function startFace() {
    VOZ
 -------------------------------------------------- */
 
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+
+/* Filtros mel: imitan cómo el oído agrupa las frecuencias */
+function buildMelFilters(sampleRate, fftSize) {
+
+    const MELS = 26;
+    const LOW = 100;
+    const HIGH = Math.min(4500, sampleRate / 2);
+
+    const toMel = f => 2595 * Math.log10(1 + f / 700);
+    const toHz = m => 700 * (Math.pow(10, m / 2595) - 1);
+
+    const points = [];
+
+    for (let i = 0; i <= MELS + 1; i++) {
+        points.push(
+            toHz(toMel(LOW) + (toMel(HIGH) - toMel(LOW)) * i / (MELS + 1))
+        );
+    }
+
+    const binHz = sampleRate / fftSize;
+    const filters = [];
+
+    for (let m = 1; m <= MELS; m++) {
+
+        const left = points[m - 1];
+        const center = points[m];
+        const right = points[m + 1];
+
+        const from = Math.max(1, Math.floor(left / binHz));
+        const to = Math.ceil(right / binHz);
+
+        const weights = [];
+
+        for (let k = from; k <= to; k++) {
+
+            const f = k * binHz;
+            let value = 0;
+
+            if (f >= left && f <= center) {
+                value = (f - left) / (center - left);
+            } else if (f > center && f <= right) {
+                value = (right - f) / (right - center);
+            }
+
+            weights.push(value);
+        }
+
+        filters.push({ from, weights });
+    }
+
+    return filters;
+}
+
+
+/* 12 coeficientes MFCC de un cuadro (sin el 0: así el volumen no influye) */
+function computeMfcc(freqData, filters) {
+
+    const logEnergies = filters.map(({ from, weights }) => {
+
+        let energy = 0;
+
+        for (let j = 0; j < weights.length; j++) {
+            const db = Math.max(freqData[from + j], -120);
+            energy += weights[j] * Math.pow(10, db / 10);
+        }
+
+        return Math.log(energy + 1e-12);
+    });
+
+    const M = logEnergies.length;
+    const coefficients = [];
+
+    for (let k = 1; k <= 12; k++) {
+
+        let sum = 0;
+
+        for (let m = 0; m < M; m++) {
+            sum += logEnergies[m] * Math.cos(Math.PI * k * (m + 0.5) / M);
+        }
+
+        coefficients.push(sum * Math.sqrt(2 / M));
+    }
+
+    return coefficients;
+}
+
+
+/* Tono (frecuencia fundamental) por autocorrelación; null si no hay voz clara */
+function estimatePitch(timeData, sampleRate) {
+
+    const minLag = Math.floor(sampleRate / 350);
+    const maxLag = Math.floor(sampleRate / 70);
+
+    let energy = 0;
+
+    for (let i = 0; i < timeData.length; i++) {
+        energy += timeData[i] * timeData[i];
+    }
+
+    if (energy === 0) {
+        return null;
+    }
+
+    let best = 0;
+    let bestLag = 0;
+
+    for (let lag = minLag; lag <= maxLag; lag++) {
+
+        let sum = 0;
+
+        for (let i = 0; i < timeData.length - lag; i += 2) {
+            sum += timeData[i] * timeData[i + lag];
+        }
+
+        if (sum > best) {
+            best = sum;
+            bestLag = lag;
+        }
+    }
+
+    if (!bestLag || (best * 2) / energy < 0.3) {
+        return null;
+    }
+
+    return sampleRate / bestLag;
+}
+
+
+/* Graba una muestra y devuelve 25 valores */
+function captureVoiceSample(durationMs) {
+
+    return new Promise((resolve, reject) => {
+
+        const sampleRate = audioContext.sampleRate;
+        const timeData = new Float32Array(analyser.fftSize);
+        const freqData = new Float32Array(analyser.frequencyBinCount);
+        const filters = buildMelFilters(sampleRate, analyser.fftSize);
+
+        const frames = [];
+        const pitches = [];
+        let counter = 0;
+        const startTime = performance.now();
+
+        function tick() {
+
+            if (!analyser) {
+                reject({ cancelled: true });
+                return;
+            }
+
+            analyser.getFloatTimeDomainData(timeData);
+
+            let energy = 0;
+
+            for (let i = 0; i < timeData.length; i++) {
+                energy += timeData[i] * timeData[i];
+            }
+
+            const rms = Math.sqrt(energy / timeData.length);
+
+            levelBar.style.width = Math.min(100, rms * 400) + '%';
+
+            // Solo cuentan los momentos en que realmente hay voz
+            if (rms > 0.01) {
+
+                analyser.getFloatFrequencyData(freqData);
+                frames.push(computeMfcc(freqData, filters));
+
+                if (counter++ % 2 === 0) {
+                    const f0 = estimatePitch(timeData, sampleRate);
+
+                    if (f0) {
+                        pitches.push(f0);
+                    }
+                }
+            }
+
+            if (performance.now() - startTime < durationMs) {
+                requestAnimationFrame(tick);
+                return;
+            }
+
+            if (frames.length < 30) {
+                reject({ userMessage: 'No se escuchó tu voz. Habla más fuerte y cerca del micrófono.' });
+                return;
+            }
+
+            if (pitches.length < 8) {
+                reject({ userMessage: 'No se detectó el tono de tu voz. Habla con voz normal, sin susurrar.' });
+                return;
+            }
+
+            const mean = [];
+            const spread = [];
+
+            for (let k = 0; k < 12; k++) {
+
+                const values = frames.map(frame => frame[k]);
+                const avg = values.reduce((a, b) => a + b, 0) / values.length;
+
+                const variance =
+                    values.reduce((a, b) => a + (b - avg) * (b - avg), 0) /
+                    values.length;
+
+                mean.push(avg);
+                spread.push(Math.sqrt(variance));
+            }
+
+            pitches.sort((a, b) => a - b);
+
+            const medianPitch = pitches[Math.floor(pitches.length / 2)];
+            const semitones = 12 * Math.log2(medianPitch / 100);
+
+            resolve(
+                [...mean, ...spread, semitones].map(v => Number(v.toFixed(4)))
+            );
+        }
+
+        tick();
+    });
+}
+
+
 async function startVoice() {
 
     if (!checkDevice()) {
@@ -623,102 +850,51 @@ async function startVoice() {
 
         source.connect(analyser);
 
-        const timeData = new Float32Array(analyser.fftSize);
-        const freqData = new Float32Array(analyser.frequencyBinCount);
+        // Al registrar se graban 3 muestras; al iniciar sesión, 1
+        const rounds = SETUP_MODE ? 3 : 1;
+        const all = [];
 
-        // 24 bandas repartidas entre 100 Hz y 4000 Hz (escala logarítmica)
-        const BANDS = 24;
-        const LOW = 100;
-        const HIGH = 4000;
-        const binHz = audioContext.sampleRate / analyser.fftSize;
+        for (let round = 1; round <= rounds; round++) {
 
-        const edges = [];
+            const prefix =
+                rounds > 1 ? 'Grabación ' + round + ' de ' + rounds + '. ' : '';
 
-        for (let b = 0; b <= BANDS; b++) {
-            edges.push(LOW * Math.pow(HIGH / LOW, b / BANDS));
-        }
+            statusEl.textContent = prefix + 'Prepárate...';
 
-        const sums = new Array(BANDS).fill(0);
-        let voiced = 0;
-        const startTime = performance.now();
-
-        statusEl.textContent =
-            'Di: "mi voz es mi contraseña" (2 segundos)...';
-
-        function capture() {
+            await sleep(round === 1 ? 1200 : 1500);
 
             if (!analyser) {
                 return;
             }
 
-            analyser.getFloatTimeDomainData(timeData);
+            statusEl.textContent = prefix + 'Di: "mi voz es mi contraseña"';
 
-            let energy = 0;
+            const sample = await captureVoiceSample(3000);
 
-            for (let i = 0; i < timeData.length; i++) {
-                energy += timeData[i] * timeData[i];
-            }
-
-            const rms = Math.sqrt(energy / timeData.length);
-
-            levelBar.style.width = Math.min(100, rms * 400) + '%';
-
-            // Solo se usan los cuadros donde realmente hay voz
-            if (rms > 0.01) {
-
-                analyser.getFloatFrequencyData(freqData);
-
-                for (let b = 0; b < BANDS; b++) {
-
-                    const from = Math.max(1, Math.floor(edges[b] / binHz));
-                    const to = Math.max(from + 1, Math.ceil(edges[b + 1] / binHz));
-
-                    let total = 0;
-
-                    for (let k = from; k < to; k++) {
-                        total += Math.max(freqData[k], -100);
-                    }
-
-                    sums[b] += total / (to - from);
-                }
-
-                voiced++;
-            }
-
-            if (performance.now() - startTime < 2000) {
-                requestAnimationFrame(capture);
-                return;
-            }
-
-            if (voiced < 15) {
-                cleanup();
-                start.disabled = false;
-                statusEl.textContent =
-                    'No se escuchó tu voz. Habla más fuerte y cerca del micrófono.';
-                return;
-            }
-
-            const average = sums.map(value => value / voiced);
-
-            // Se resta el promedio: así el volumen no influye, solo el timbre
-            const mean = average.reduce((a, b) => a + b, 0) / BANDS;
-
-            template.value = JSON.stringify(
-                average.map(value => Number((value - mean).toFixed(3)))
-            );
-
-            statusEl.textContent = 'Muestra capturada. Verificando...';
-
-            submitAuthentication();
+            all.push(...sample);
         }
 
-        capture();
+        template.value = JSON.stringify(all);
+
+        statusEl.textContent = 'Muestra capturada. Verificando...';
+
+        submitAuthentication();
 
     }
 
     catch (error) {
 
         start.disabled = false;
+
+        if (error && error.cancelled) {
+            return;
+        }
+
+        if (error && error.userMessage) {
+            cleanup();
+            statusEl.textContent = error.userMessage;
+            return;
+        }
 
         showMicrophoneError(error);
 
