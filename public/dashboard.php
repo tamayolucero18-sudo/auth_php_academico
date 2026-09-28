@@ -6,11 +6,31 @@ require_login();
 
 $user = current_user();
 
-$displayUserId = user_public_id($user);
-
 $roleLabel = $user['role'] ?? 'Gestor';
-
+$accessMethods = [
+    'face' => 'Reconocimiento facial',
+    'voice' => 'Reconocimiento de voz',
+    'fingerprint' => 'Huella digital',
+    'pattern' => 'Patrón de acceso',
+];
 $pdo = db();
+
+$accessMethod = $user['access_method'] ?? '';
+if (!isset($accessMethods[$accessMethod])) {
+    $stmt = $pdo->prepare(
+        "SELECT method
+         FROM login_attempts
+         WHERE user_id = ?
+           AND success = 1
+           AND method IN ('face', 'voice', 'fingerprint', 'pattern')
+         ORDER BY id DESC
+         LIMIT 1"
+    );
+    $stmt->execute([(int)$user['id']]);
+    $accessMethod = (string)($stmt->fetchColumn() ?: '');
+}
+
+$accessMethodLabel = $accessMethods[$accessMethod] ?? 'No especificado';
 
 $stmt = $pdo->prepare('SELECT face_template, voice_template FROM users WHERE id = ?');
 $stmt->execute([(int)$user['id']]);
@@ -59,8 +79,7 @@ $biometrics = [
 <span class="welcome-tag">Panel principal</span>
 
 <h1>
-    Bienvenido,
-    <?= e($user['name']) ?>
+    Bienvenido
 </h1>
 
 </div>
@@ -70,18 +89,18 @@ $biometrics = [
 <div class="welcome-details">
 
 <div class="detail-row">
-    <span class="detail-label">Nombre:</span>
+    <span class="detail-label">Nombre de usuario:</span>
     <strong><?= e($user['name']) ?></strong>
-</div>
-
-<div class="detail-row">
-    <span class="detail-label">ID:</span>
-    <strong><?= e($displayUserId) ?></strong>
 </div>
 
 <div class="detail-row">
     <span class="detail-label">Rol:</span>
     <strong><?= e($roleLabel) ?></strong>
+</div>
+
+<div class="detail-row">
+    <span class="detail-label">Método de acceso:</span>
+    <strong><?= e($accessMethodLabel) ?></strong>
 </div>
 
 </div>

@@ -71,33 +71,29 @@ try {
      */
     if ($action === 'login') {
 
-        $name = trim((string)($data['name'] ?? ''));
+        $identity = trim((string)($data['name'] ?? ''));
 
-        if ($name === '' || strlen($name) > 120) {
-            json_out(['success' => false, 'message' => 'Escribe tu nombre.'], 400);
+        if ($identity === '' || strlen($identity) > 120) {
+            json_out(['success' => false, 'message' => 'Escribe tu nombre de usuario o ID.'], 400);
         }
 
-        $stmt = db()->prepare(
-            'SELECT id FROM users WHERE name = ? AND active = 1 LIMIT 1'
-        );
-        $stmt->execute([$name]);
-        $found = $stmt->fetch();
+        $found = find_user_by_identity(db(), $identity);
+        if (!$found || (int)$found['active'] !== 1) {
+            json_out(['success' => false, 'message' => 'No existe una cuenta activa con ese nombre o ID.'], 404);
+        }
 
         $ids = [];
 
-        if ($found) {
-            $stmt = db()->prepare(
-                'SELECT credential_id FROM webauthn_credentials WHERE user_id = ?'
-            );
-            $stmt->execute([(int)$found['id']]);
+        $stmt = db()->prepare(
+            'SELECT credential_id FROM webauthn_credentials WHERE user_id = ?'
+        );
+        $stmt->execute([(int)$found['id']]);
 
-            $ids = array_map(
-                fn(array $row) => b64u_decode($row['credential_id']),
-                $stmt->fetchAll()
-            );
-        }
+        $ids = array_map(
+            fn(array $row) => b64u_decode($row['credential_id']),
+            $stmt->fetchAll()
+        );
 
-        // Mismo mensaje si el usuario no existe o no tiene huella
         if (!$ids) {
             json_out([
                 'success' => false,

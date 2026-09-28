@@ -134,15 +134,10 @@ if (($_POST['setup'] ?? '') === '1') {
 $method =
     $_POST['method'] ?? '';
 
-$usesName = in_array($method, ['face', 'voice'], true);
+$usesIdentity = in_array($method, ['face', 'voice', 'fingerprint'], true);
 
 $identity =
     trim($_POST['email'] ?? '');
-
-$email =
-    $usesName
-        ? null
-        : filter_var($identity, FILTER_VALIDATE_EMAIL);
 
 $template =
     trim(
@@ -157,8 +152,7 @@ $template =
 if (
     !in_array($method, ['face', 'voice', 'fingerprint'], true) ||
     $template === '' ||
-    ($usesName && ($identity === '' || strlen($identity) > 120)) ||
-    (!$usesName && !$email)
+    ($usesIdentity && ($identity === '' || strlen($identity) > 120))
 ) {
 
     header(
@@ -174,7 +168,7 @@ if (
 
 $incomingTemplate = null;
 
-if ($usesName) {
+if (in_array($method, ['face', 'voice'], true)) {
     $decodedTemplate = json_decode($template, true);
     $expectedValues = $method === 'face' ? 128 : VOICE_DIMS;
 
@@ -201,43 +195,11 @@ if ($usesName) {
  */
 
 $pdo = db();
-$templateColumns = [
-    'face' => 'face_template',
-    'voice' => 'voice_template'
-];
+$user = find_user_by_identity($pdo, $identity);
 
-$stmt = $pdo->prepare(
-    $usesName
-        ? 'SELECT * FROM users WHERE name = ? LIMIT 1'
-        : 'SELECT * FROM users WHERE email = ? LIMIT 1'
-);
-
-$stmt->execute([
-    $usesName ? $identity : $email
-]);
-
-$user =
-    $stmt->fetch();
-
-if ($usesName && !$user) {
-    $emailPrefix = strtolower((string)preg_replace('/[^a-zA-Z0-9]+/', '.', $identity));
-    $emailPrefix = trim(substr($emailPrefix, 0, 80), '.');
-    $generatedEmail = ($emailPrefix !== '' ? $emailPrefix : 'usuario') . '.' . bin2hex(random_bytes(6)) . '@local.test';
-    $passwordHash = password_hash(bin2hex(random_bytes(32)), PASSWORD_DEFAULT);
-    $templateJson = json_encode($incomingTemplate, JSON_THROW_ON_ERROR);
-    $templateColumn = $templateColumns[$method];
-
-    $insert = $pdo->prepare(
-        "INSERT INTO users
-         (name, email, password_hash, role, active, {$templateColumn})
-         VALUES (?, ?, ?, 'Gestor', 1, ?)"
-    );
-    $insert->execute([$identity, $generatedEmail, $passwordHash, $templateJson]);
-
-    $userId = (int)$pdo->lastInsertId();
-    $userStmt = $pdo->prepare('SELECT * FROM users WHERE id = ? LIMIT 1');
-    $userStmt->execute([$userId]);
-    $user = $userStmt->fetch();
+if (!$user) {
+    header('Location: biometric.php?method=' . urlencode($method) . '&error=' . urlencode('No existe una cuenta con ese nombre o ID. Verifica tus datos e inténtalo de nuevo.'));
+    exit;
 }
 
 
@@ -460,7 +422,10 @@ if ($success) {
             $user['email'],
 
         'role' =>
-            $user['role']
+            $user['role'],
+
+        'access_method' =>
+            $method
 
     ];
 

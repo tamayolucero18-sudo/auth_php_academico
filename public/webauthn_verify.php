@@ -159,7 +159,8 @@ try {
             'id'    => (int)$row['id'],
             'name'  => $row['name'],
             'email' => $row['email'],
-            'role'  => $row['role']
+            'role'  => $row['role'],
+            'access_method' => 'fingerprint'
         ];
 
         json_out(['success' => true, 'redirect' => 'dashboard.php']);

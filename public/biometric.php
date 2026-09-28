@@ -71,18 +71,18 @@ $setup = ($_GET['setup'] ?? '') === '1' && current_user() !== null;
     class="alert danger hidden"
 ></div>
 
-<!-- EMAIL -->
+<!-- IDENTIDAD -->
 
 <div class="field">
 
 <label for="email">
-    Nombre del usuario
+    Nombre de usuario o ID
 </label>
 
 <input
     id="email"
     type="text"
-    placeholder="Escribe tu nombre"
+    placeholder="Escribe tu nombre o ID (por ejemplo, 1A)"
     autocomplete="name"
     required
 >
