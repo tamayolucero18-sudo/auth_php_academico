@@ -29,3 +29,18 @@ CREATE TABLE IF NOT EXISTS login_attempts (
         REFERENCES users(id)
         ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS webauthn_credentials (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    user_id INT UNSIGNED NOT NULL,
+    credential_id VARCHAR(255) NOT NULL UNIQUE,
+    public_key TEXT NOT NULL,
+    sign_count INT UNSIGNED NOT NULL DEFAULT 0,
+    label VARCHAR(100) NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_used_at TIMESTAMP NULL,
+    CONSTRAINT fk_webauthn_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE
+);

@@ -4,6 +4,78 @@ require __DIR__ . '/../config/config.php';
 
 verify_csrf();
 
+/*
+ * Voz: vector de 24 bandas de frecuencia (timbre).
+ * VOICE_MAX_DISTANCE = diferencia promedio máxima en dB entre la voz
+ * guardada y la nueva. Más bajo = más estricto. Calíbralo con pruebas
+ * (la distancia real queda anotada en login_attempts.reason).
+ */
+const VOICE_DIMS = 24;
+const VOICE_MAX_DISTANCE = 6.0;
+
+
+/*
+ * REGISTRO desde el panel (rostro / voz).
+ * Responde JSON para poder mostrar el error exacto sin recargar.
+ */
+
+if (($_POST['setup'] ?? '') === '1') {
+
+    header('Content-Type: application/json; charset=utf-8');
+
+    $fail = function (string $message, int $status = 400): void {
+        http_response_code($status);
+        echo json_encode(['success' => false, 'message' => $message]);
+        exit;
+    };
+
+    $current = current_user();
+    $setupMethod = $_POST['method'] ?? '';
+
+    if (!$current) {
+        $fail('Tu sesión expiró. Inicia sesión otra vez.', 401);
+    }
+
+    $expected = $setupMethod === 'face' ? 128 : ($setupMethod === 'voice' ? VOICE_DIMS : 0);
+    $values = json_decode((string)($_POST['template'] ?? ''), true);
+
+    if ($expected === 0) {
+        $fail('Método inválido.');
+    }
+
+    if (!is_array($values) || count($values) !== $expected) {
+        $fail('No se pudieron leer los datos (se esperaban ' . $expected . ' valores). Inténtalo de nuevo.');
+    }
+
+    $clean = [];
+
+    foreach ($values as $value) {
+        if (!is_numeric($value) || !is_finite((float)$value)) {
+            $fail('Los datos capturados no son válidos. Inténtalo de nuevo.');
+        }
+
+        $clean[] = (float)$value;
+    }
+
+    $column = $setupMethod === 'face' ? 'face_template' : 'voice_template';
+
+    $update = db()->prepare("UPDATE users SET {$column} = ? WHERE id = ?");
+    $update->execute([
+        json_encode($clean, JSON_THROW_ON_ERROR),
+        (int)$current['id']
+    ]);
+
+    log_attempt((int)$current['id'], $setupMethod . '-register', true, null);
+
+    echo json_encode([
+        'success' => true,
+        'message' => $setupMethod === 'face'
+            ? 'Rostro registrado correctamente.'
+            : 'Voz registrada correctamente.'
+    ]);
+    exit;
+}
+
 $method =
     $_POST['method'] ?? '';
 
@@ -49,7 +121,7 @@ $incomingTemplate = null;
 
 if ($usesName) {
     $decodedTemplate = json_decode($template, true);
-    $expectedValues = $method === 'face' ? 128 : 3;
+    $expectedValues = $method === 'face' ? 128 : VOICE_DIMS;
 
     if (!is_array($decodedTemplate) || count($decodedTemplate) !== $expectedValues) {
         header('Location: biometric.php?method=' . urlencode($method) . '&error=' . urlencode('No se pudieron leer los datos biométricos. Inténtalo de nuevo.'));
@@ -224,7 +296,7 @@ if (
             );
 
 
-        if (is_array($incoming) && (!is_array($stored) || count($stored) !== 3)) {
+        if (is_array($incoming) && (!is_array($stored) || count($stored) !== VOICE_DIMS)) {
             if ((int)(current_user()['id'] ?? 0) === (int)$user['id']) {
                 $update = $pdo->prepare('UPDATE users SET voice_template = ? WHERE id = ?');
                 $update->execute([
@@ -240,41 +312,30 @@ if (
         } elseif (
             is_array($incoming) &&
             is_array($stored) &&
-            count($incoming) === 3 &&
-            count($stored) === 3
+            count($incoming) === VOICE_DIMS &&
+            count($stored) === VOICE_DIMS
         ) {
 
-            $distance = 0;
+            // Diferencia promedio (RMS) por banda, en dB
+            $sum = 0.0;
 
-            for (
-                $i = 0;
-                $i < 3;
-                $i++
-            ) {
-
-                $distance +=
-                    abs(
-                        (float)$incoming[$i] -
-                        (float)$stored[$i]
-                    );
-
+            for ($i = 0; $i < VOICE_DIMS; $i++) {
+                $difference = (float)$incoming[$i] - (float)$stored[$i];
+                $sum += $difference * $difference;
             }
 
+            $distance = sqrt($sum / VOICE_DIMS);
 
-            /*
-             * Prototipo académico.
-             */
-
-            if (
-                $distance < 0.35
-            ) {
-
+            if ($distance < VOICE_MAX_DISTANCE) {
                 $success = true;
-
-                $reason =
-                    null;
-
+                $reason = null;
+            } else {
+                $reason = 'Voz no coincide (distancia ' . round($distance, 2) . ')';
             }
+
+        } elseif (is_array($stored) && count($stored) !== VOICE_DIMS) {
+
+            $reason = 'Tu voz se registró con una versión anterior. Regístrala de nuevo.';
 
         }
 

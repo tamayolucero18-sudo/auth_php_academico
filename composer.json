@@ -1,0 +1,9 @@
+{
+    "name": "academico/auth-php",
+    "description": "Sistema de autenticación multimodal",
+    "require": {
+        "php": ">=8.0",
+        "ext-openssl": "*",
+        "lbuchs/webauthn": "^2.0"
+    }
+}

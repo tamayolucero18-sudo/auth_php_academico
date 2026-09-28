@@ -16,6 +16,9 @@ if (!in_array($method, $allowed, true)) {
 
 $csrf = csrf_token();
 
+// Modo registro: solo si ya hay sesión iniciada
+$setup = ($_GET['setup'] ?? '') === '1' && current_user() !== null;
+
 ?>
 
 <!DOCTYPE html>
@@ -177,6 +180,12 @@ $csrf = csrf_token();
 
 <input
     type="hidden"
+    name="setup"
+    value="<?= $setup ? '1' : '0' ?>"
+>
+
+<input
+    type="hidden"
     name="email"
     id="emailValue"
 >
@@ -197,6 +206,14 @@ $csrf = csrf_token();
 <script>
 
 const METHOD = <?= json_encode($method) ?>;
+
+const SETUP_MODE = <?= json_encode($setup) ?>;
+
+const CSRF = <?= json_encode($csrf) ?>;
+
+const CURRENT_NAME = <?= json_encode(current_user()['name'] ?? '') ?>;
+
+const SERVER_ERROR = <?= json_encode($_GET['error'] ?? '') ?>;
 
 const title =
     document.getElementById('title');
@@ -275,13 +292,30 @@ const titles = {
 title.textContent =
     titles[METHOD];
 
-if (METHOD === 'fingerprint') {
-    document.querySelector('label[for="email"]').textContent =
-        'Correo del usuario';
-    email.type = 'email';
-    email.placeholder = 'usuario@correo.com';
-    email.autocomplete = 'email';
+if (SETUP_MODE && METHOD !== 'fingerprint') {
+    // Registro desde el panel: se usa el nombre de la sesión
+    email.value = CURRENT_NAME;
+    email.closest('.field').classList.add('hidden');
+
+    if (METHOD === 'face') {
+        title.textContent = '👤 Registrar rostro';
+        start.textContent = 'Registrar rostro';
+    } else {
+        title.textContent = '🎤 Registrar voz';
+        start.textContent = 'Registrar voz';
+    }
 }
+
+if (METHOD === 'fingerprint') {
+    if (SETUP_MODE) {
+        // Ya hay sesión: no hace falta escribir el nombre
+        email.closest('.field').classList.add('hidden');
+
+        title.textContent = '👆 Registrar huella / Passkey';
+        start.textContent = 'Registrar huella';
+    }
+}
+
 
 
 /* --------------------------------------------------
@@ -557,85 +591,59 @@ async function startVoice() {
 
     start.disabled = true;
 
-    cameraBox.classList.add(
-        'hidden'
-    );
-
-    voiceBox.classList.remove(
-        'hidden'
-    );
-
+    cameraBox.classList.add('hidden');
+    voiceBox.classList.remove('hidden');
 
     try {
 
-        statusEl.textContent =
-            'Solicitando micrófono...';
+        statusEl.textContent = 'Solicitando micrófono...';
 
-
+        // Sin filtros del navegador: alteran el timbre y dan capturas inconsistentes
         microphoneStream =
-            await navigator.mediaDevices
-                .getUserMedia({
-
-                    audio: {
-
-                        echoCancellation: true,
-
-                        noiseSuppression: true,
-
-                        autoGainControl: true
-
-                    },
-
-                    video: false
-
-                });
-
+            await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: false,
+                    noiseSuppression: false,
+                    autoGainControl: false
+                },
+                video: false
+            });
 
         audioContext =
-            new (
-                window.AudioContext ||
-                window.webkitAudioContext
-            )();
-
+            new (window.AudioContext || window.webkitAudioContext)();
 
         await audioContext.resume();
 
-
         const source =
-            audioContext
-                .createMediaStreamSource(
-                    microphoneStream
-                );
+            audioContext.createMediaStreamSource(microphoneStream);
 
+        analyser = audioContext.createAnalyser();
+        analyser.fftSize = 2048;
+        analyser.smoothingTimeConstant = 0;
 
-        analyser =
-            audioContext.createAnalyser();
+        source.connect(analyser);
 
+        const timeData = new Float32Array(analyser.fftSize);
+        const freqData = new Float32Array(analyser.frequencyBinCount);
 
-        analyser.fftSize =
-            1024;
+        // 24 bandas repartidas entre 100 Hz y 4000 Hz (escala logarítmica)
+        const BANDS = 24;
+        const LOW = 100;
+        const HIGH = 4000;
+        const binHz = audioContext.sampleRate / analyser.fftSize;
 
+        const edges = [];
 
-        source.connect(
-            analyser
-        );
+        for (let b = 0; b <= BANDS; b++) {
+            edges.push(LOW * Math.pow(HIGH / LOW, b / BANDS));
+        }
 
-
-        const data =
-            new Float32Array(
-                analyser.fftSize
-            );
-
-
-        const samples = [];
-
-        const startTime =
-            performance.now();
-
+        const sums = new Array(BANDS).fill(0);
+        let voiced = 0;
+        const startTime = performance.now();
 
         statusEl.textContent =
-            'Habla durante 1 segundo...';
-
+            'Di: "mi voz es mi contraseña" (2 segundos)...';
 
         function capture() {
 
@@ -643,130 +651,66 @@ async function startVoice() {
                 return;
             }
 
-
-            analyser.getFloatTimeDomainData(
-                data
-            );
-
+            analyser.getFloatTimeDomainData(timeData);
 
             let energy = 0;
 
-            let absolute = 0;
+            for (let i = 0; i < timeData.length; i++) {
+                energy += timeData[i] * timeData[i];
+            }
 
-            let zeroCrossings = 0;
+            const rms = Math.sqrt(energy / timeData.length);
 
+            levelBar.style.width = Math.min(100, rms * 400) + '%';
 
-            for (
-                let i = 0;
-                i < data.length;
-                i++
-            ) {
+            // Solo se usan los cuadros donde realmente hay voz
+            if (rms > 0.01) {
 
-                energy +=
-                    data[i] *
-                    data[i];
+                analyser.getFloatFrequencyData(freqData);
 
-                absolute +=
-                    Math.abs(
-                        data[i]
-                    );
+                for (let b = 0; b < BANDS; b++) {
 
+                    const from = Math.max(1, Math.floor(edges[b] / binHz));
+                    const to = Math.max(from + 1, Math.ceil(edges[b + 1] / binHz));
 
-                if (
-                    i > 0 &&
-                    data[i] *
-                    data[i - 1] < 0
-                ) {
+                    let total = 0;
 
-                    zeroCrossings++;
+                    for (let k = from; k < to; k++) {
+                        total += Math.max(freqData[k], -100);
+                    }
 
+                    sums[b] += total / (to - from);
                 }
 
+                voiced++;
             }
 
-
-            const rms =
-                Math.sqrt(
-                    energy /
-                    data.length
-                );
-
-
-            const mean =
-                absolute /
-                data.length;
-
-
-            const zcr =
-                zeroCrossings /
-                data.length;
-
-
-            samples.push([
-                rms,
-                mean,
-                zcr
-            ]);
-
-
-            levelBar.style.width =
-                Math.min(
-                    100,
-                    mean * 1000
-                ) + '%';
-
-
-            if (
-                performance.now() -
-                startTime < 1000
-            ) {
-
-                requestAnimationFrame(
-                    capture
-                );
-
+            if (performance.now() - startTime < 2000) {
+                requestAnimationFrame(capture);
+                return;
             }
 
-            else {
-
-                const average =
-                    samples
-                        .reduce(
-                            (total, current) => {
-
-                                return total.map(
-                                    (value, index) =>
-                                        value +
-                                        current[index]
-                                );
-
-                            },
-
-                            [0, 0, 0]
-                        )
-                        .map(
-                            value =>
-                                value /
-                                samples.length
-                        );
-
-
-                template.value =
-                    JSON.stringify(
-                        average
-                    );
-
-
+            if (voiced < 15) {
+                cleanup();
+                start.disabled = false;
                 statusEl.textContent =
-                    'Muestra capturada. Verificando...';
-
-
-                submitAuthentication();
-
+                    'No se escuchó tu voz. Habla más fuerte y cerca del micrófono.';
+                return;
             }
 
-        }
+            const average = sums.map(value => value / voiced);
 
+            // Se resta el promedio: así el volumen no influye, solo el timbre
+            const mean = average.reduce((a, b) => a + b, 0) / BANDS;
+
+            template.value = JSON.stringify(
+                average.map(value => Number((value - mean).toFixed(3)))
+            );
+
+            statusEl.textContent = 'Muestra capturada. Verificando...';
+
+            submitAuthentication();
+        }
 
         capture();
 
@@ -787,170 +731,168 @@ async function startVoice() {
    WEBAUTHN
 -------------------------------------------------- */
 
-async function startFingerprint() {
+async function webauthnPost(url, payload) {
 
-    cameraBox.classList.add(
-        'hidden'
+    const response = await fetch(url, {
+        method: 'POST',
+        credentials: 'same-origin',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...payload, csrf: CSRF })
+    });
+
+    let data = null;
+
+    try {
+        data = await response.json();
+    } catch (e) {}
+
+    if (!response.ok || !data || !data.success) {
+        throw new Error(
+            (data && data.message) ||
+            'Error del servidor (' + response.status + ').'
+        );
+    }
+
+    return data;
+}
+
+
+async function registerPasskey() {
+
+    statusEl.textContent = 'Preparando registro...';
+
+    const { publicKey } = await webauthnPost(
+        'webauthn_options.php',
+        { action: 'register' }
     );
 
-    voiceBox.classList.add(
-        'hidden'
+    publicKey.challenge = base64ToArrayBuffer(publicKey.challenge);
+    publicKey.user.id = base64ToArrayBuffer(publicKey.user.id);
+
+    (publicKey.excludeCredentials || []).forEach(
+        c => c.id = base64ToArrayBuffer(c.id)
     );
 
-    fingerprintBox.classList.remove(
-        'hidden'
-    );
+    statusEl.textContent = 'Confirma con tu huella, rostro o PIN...';
 
-
-    if (
-        !secureMediaAvailable()
-    ) {
-
-        throw new Error(
-            'WebAuthn requiere HTTPS cuando no estás en localhost.'
-        );
-
-    }
-
-
-    if (
-        !window.PublicKeyCredential
-    ) {
-
-        throw new Error(
-            'Este navegador no soporta WebAuthn.'
-        );
-
-    }
-
-
-    const userEmail =
-        email.value.trim();
-
-
-    if (!userEmail) {
-
-        throw new Error(
-            'Escribe el correo del usuario.'
-        );
-
-    }
-
-
-    statusEl.textContent =
-        'Preparando autenticación del dispositivo...';
-
-
-    const response =
-        await fetch(
-            'webauthn_options.php?email=' +
-            encodeURIComponent(
-                userEmail
-            )
-        );
-
-
-    if (!response.ok) {
-
-        throw new Error(
-            'No se pudieron obtener las opciones WebAuthn.'
-        );
-
-    }
-
-
-    const options =
-        await response.json();
-
-
-    options.challenge =
-        base64ToArrayBuffer(
-            options.challenge
-        );
-
-
-    if (
-        options.allowCredentials
-    ) {
-
-        options.allowCredentials =
-            options.allowCredentials.map(
-                credential => ({
-
-                    ...credential,
-
-                    id:
-                        base64ToArrayBuffer(
-                            credential.id
-                        )
-
-                })
-            );
-
-    }
-
-
-    const credential =
-        await navigator.credentials.get({
-
-            publicKey: options
-
-        });
-
+    const credential = await navigator.credentials.create({ publicKey });
 
     if (!credential) {
-
-        throw new Error(
-            'No se recibió una credencial.'
-        );
-
+        throw new Error('No se recibió la credencial.');
     }
 
+    statusEl.textContent = 'Guardando huella...';
 
-    template.value =
-        JSON.stringify({
-
-            id:
-                credential.id,
-
-            rawId:
-                arrayBufferToBase64(
-                    credential.rawId
-                ),
-
+    await webauthnPost('webauthn_verify.php', {
+        action: 'register',
+        credential: {
+            id: credential.id,
+            rawId: arrayBufferToBase64(credential.rawId),
+            type: credential.type,
             response: {
-
-                authenticatorData:
-                    arrayBufferToBase64(
-                        credential
-                            .response
-                            .authenticatorData
-                    ),
-
                 clientDataJSON:
-                    arrayBufferToBase64(
-                        credential
-                            .response
-                            .clientDataJSON
-                    ),
+                    arrayBufferToBase64(credential.response.clientDataJSON),
+                attestationObject:
+                    arrayBufferToBase64(credential.response.attestationObject)
+            }
+        }
+    });
 
+    statusEl.textContent = '¡Huella registrada! Redirigiendo...';
+
+    setTimeout(() => { location.href = 'dashboard.php'; }, 1200);
+}
+
+
+async function loginWithPasskey() {
+
+    statusEl.textContent = 'Preparando autenticación...';
+
+    const { publicKey } = await webauthnPost(
+        'webauthn_options.php',
+        { action: 'login', name: email.value.trim() }
+    );
+
+    publicKey.challenge = base64ToArrayBuffer(publicKey.challenge);
+
+    (publicKey.allowCredentials || []).forEach(
+        c => c.id = base64ToArrayBuffer(c.id)
+    );
+
+    statusEl.textContent = 'Usa tu huella, rostro o PIN...';
+
+    const credential = await navigator.credentials.get({ publicKey });
+
+    if (!credential) {
+        throw new Error('No se recibió la credencial.');
+    }
+
+    statusEl.textContent = 'Verificando...';
+
+    const result = await webauthnPost('webauthn_verify.php', {
+        action: 'login',
+        credential: {
+            id: credential.id,
+            rawId: arrayBufferToBase64(credential.rawId),
+            type: credential.type,
+            response: {
+                clientDataJSON:
+                    arrayBufferToBase64(credential.response.clientDataJSON),
+                authenticatorData:
+                    arrayBufferToBase64(credential.response.authenticatorData),
                 signature:
-                    arrayBufferToBase64(
-                        credential
-                            .response
-                            .signature
-                    )
+                    arrayBufferToBase64(credential.response.signature),
+                userHandle: credential.response.userHandle
+                    ? arrayBufferToBase64(credential.response.userHandle)
+                    : null
+            }
+        }
+    });
 
-            },
-
-            type:
-                credential.type
-
-        });
+    location.href = result.redirect || 'dashboard.php';
+}
 
 
-    submitAuthentication();
+async function startFingerprint() {
 
+    cameraBox.classList.add('hidden');
+    voiceBox.classList.add('hidden');
+    fingerprintBox.classList.remove('hidden');
+
+    if (!window.isSecureContext) {
+        throw new Error(
+            'WebAuthn requiere HTTPS (o localhost). Abre el sitio con un enlace https://.'
+        );
+    }
+
+    if (!window.PublicKeyCredential) {
+        throw new Error('Este navegador no soporta WebAuthn.');
+    }
+
+    start.disabled = true;
+
+    try {
+
+        if (SETUP_MODE) {
+            await registerPasskey();
+        } else {
+            await loginWithPasskey();
+        }
+
+    } catch (error) {
+
+        start.disabled = false;
+
+        if (error.name === 'NotAllowedError') {
+            throw new Error('Operación cancelada o tiempo agotado. Inténtalo de nuevo.');
+        }
+
+        if (error.name === 'InvalidStateError') {
+            throw new Error('Este dispositivo ya tiene una huella registrada para tu cuenta.');
+        }
+
+        throw error;
+    }
 }
 
 
@@ -1169,12 +1111,65 @@ function cleanup() {
    ENVIAR AUTENTICACIÓN
 -------------------------------------------------- */
 
-function submitAuthentication() {
+async function submitAuthentication() {
 
     cleanup();
 
     emailValue.value =
         email.value.trim();
+
+    // Registro desde el panel: se envía sin recargar y se muestra el error real
+    if (SETUP_MODE && METHOD !== 'fingerprint') {
+
+        statusEl.textContent = 'Guardando...';
+
+        try {
+
+            const body = new URLSearchParams({
+                csrf: CSRF,
+                method: METHOD,
+                setup: '1',
+                template: template.value
+            });
+
+            const response = await fetch(form.getAttribute('action'), {
+                method: 'POST',
+                credentials: 'same-origin',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body
+            });
+
+            let data = null;
+
+            try {
+                data = await response.json();
+            } catch (e) {}
+
+            if (!response.ok || !data || !data.success) {
+                throw new Error(
+                    (data && data.message) ||
+                    'Error del servidor (' + response.status + ').'
+                );
+            }
+
+            statusEl.textContent = data.message;
+
+            setTimeout(() => {
+                location.href =
+                    'dashboard.php?ok=' + encodeURIComponent(data.message);
+            }, 800);
+
+        } catch (error) {
+
+            start.disabled = false;
+
+            statusEl.textContent = 'Error: ' + error.message;
+        }
+
+        return;
+    }
 
     form.submit();
 
@@ -1192,13 +1187,14 @@ start.addEventListener(
         try {
 
             if (
+                (METHOD !== 'fingerprint' || !SETUP_MODE) &&
                 !email.value.trim()
             ) {
 
                 statusEl.textContent =
                     METHOD === 'face'
                         ? 'Escribe primero tu nombre.'
-                        : 'Escribe primero el correo del usuario.';
+                        : 'Escribe primero tu nombre.';
 
                 return;
 
@@ -1270,6 +1266,10 @@ stop.addEventListener(
 -------------------------------------------------- */
 
 checkDevice();
+
+if (SERVER_ERROR) {
+    statusEl.textContent = SERVER_ERROR;
+}
 
 </script>
 

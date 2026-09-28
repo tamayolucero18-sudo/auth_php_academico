@@ -9,6 +9,7 @@ declare(strict_types=1);
 $isHttps = (
     (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
     || (isset($_SERVER['SERVER_PORT']) && (int)$_SERVER['SERVER_PORT'] === 443)
+    || (($_SERVER['HTTP_X_FORWARDED_PROTO'] ?? '') === 'https') // ngrok / cloudflared
 );
 
 session_set_cookie_params([
@@ -214,4 +215,61 @@ function log_attempt(...$args): void
         $ip,
         $reason
     ]);
+}
+
+/*
+ * ==========================================================
+ * WEBAUTHN (huella / Face ID / PIN del celular)
+ * ==========================================================
+ */
+
+/*
+ * RP ID = dominio de tu sitio (SIN https:// y SIN puerto).
+ * Ejemplo: 'mi-proyecto.ngrok-free.app'
+ * Si lo dejas vacío se toma del host de la petición (cómodo en desarrollo;
+ * en producción fíjalo).
+ */
+const WEBAUTHN_RP_ID = '';
+
+function webauthn_rp_id(): string
+{
+    if (WEBAUTHN_RP_ID !== '') {
+        return WEBAUTHN_RP_ID;
+    }
+
+    $host = $_SERVER['HTTP_X_FORWARDED_HOST'] ?? $_SERVER['HTTP_HOST'] ?? 'localhost';
+    $host = explode(',', $host)[0];
+
+    return strtolower(preg_replace('/:\d+$/', '', trim($host)));
+}
+
+function webauthn(): \lbuchs\WebAuthn\WebAuthn
+{
+    require_once __DIR__ . '/../vendor/autoload.php';
+
+    // 4.º parámetro true = usa base64url en el JSON
+    return new \lbuchs\WebAuthn\WebAuthn(
+        'Sistema de Autenticación Multimodal',
+        webauthn_rp_id(),
+        ['none', 'packed', 'android-key', 'apple', 'tpm', 'fido-u2f'],
+        true
+    );
+}
+
+function b64u_encode(string $binary): string
+{
+    return rtrim(strtr(base64_encode($binary), '+/', '-_'), '=');
+}
+
+function b64u_decode(string $value): string
+{
+    $value = strtr($value, '-_', '+/');
+    $value .= str_repeat('=', (4 - strlen($value) % 4) % 4);
+    $decoded = base64_decode($value, true);
+
+    if ($decoded === false) {
+        throw new InvalidArgumentException('Base64 inválido.');
+    }
+
+    return $decoded;
 }
